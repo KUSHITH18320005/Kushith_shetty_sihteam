@@ -1,0 +1,808 @@
+/**
+ * AntarcticOverview Page
+ *
+ * Primary Mission Planning & Situational Awareness Dashboard for Antarctic Polar Navigation.
+ *
+ * Key System Capabilities:
+ * 1. Dual Viewport Engines:
+ *    - 3D Globe: CesiumJS WebGL globe with hardware-accelerated instanced primitives (40,000+ icebergs).
+ *    - 2D Tactical: High-performance HTML5 Canvas radar display with real coastlines & vessel proximity rings.
+ * 2. Deep URL Query Route Synchronization:
+ *    - Automatically synchronizes application view mode (`?view=tactical` vs `?view=globe`) and layer filter
+ *      (`?filter=all|moving|fixed|ports`) with browser history (`pushState` / `popstate`).
+ * 3. 3-Tier Maritime Navigation Routing:
+ *    - Computes safe polar navigational tracks avoiding landmasses and grounded ice hazards.
+ * 4. Spatial Ice Hazard Risk Assessment:
+ *    - Evaluates proximity, crossing angles, and collision cones for USNIC macro polygons,
+ *      Sentinel-1 SAR grounded targets, and BYU/NIC historical drift tracks.
+ * 5. Deterministic Vessel Kinematics Simulation:
+ *    - Continuous Great Circle interpolation along route geometry at selectable time-multipliers (1x to 30x).
+ */
+
+import { useRef, useState, useEffect, useMemo, useCallback, type FC } from 'react';
+import {
+  CesiumGlobe,
+  CesiumGlobeRef,
+  Tactical2DView,
+  VesselInfoCard,
+  PortAnnotation,
+  DepartureAnnotation,
+  DestinationAnnotation,
+  DriftingIcebergAnnotation,
+  RouteSummaryPanel,
+  LayerHighlightToggle,
+  Header,
+} from '../components';
+import { DEMO_VESSEL_CONFIG, VesselConfiguration } from '../config/vessel';
+import type {
+  PortRecord,
+  IcebergRecord,
+  Sentinel1GroundedIcebergRecord,
+  DriftingIcebergTrajectoryRecord,
+  IceHazardAnalysisReport,
+  IcebergHazardItem,
+  MaritimeRouteResult,
+  RouteGeometryProfile,
+  RouteSimulationPoint,
+  LayerFilterMode,
+} from '../types';
+import { loadPortDataset } from '../services/portService';
+import { loadIcebergDataset } from '../services/icebergService';
+import { loadSentinel1GroundedIcebergDataset } from '../services/sentinel1IcebergService';
+import { loadDriftingIcebergDataset } from '../services/driftingIcebergService';
+import { requestMaritimeRoute, cancelCurrentRouting } from '../services/maritimeRoutingWorkerService';
+import { analyzeRouteIcebergHazards } from '../services/iceHazardService';
+import {
+  buildRouteGeometryProfile,
+  evaluateSimulationPoint,
+} from '../services/routeSimulationService';
+
+export const AntarcticOverview: FC = () => {
+  const globeRef = useRef<CesiumGlobeRef>(null);
+  const [activeView, setActiveView] = useState<'3D_GLOBE' | '2D_TACTICAL'>('3D_GLOBE');
+  const [layerFilter, setLayerFilter] = useState<LayerFilterMode>('ALL');
+
+  // Scientific Datasets
+  const [ports, setPorts] = useState<PortRecord[]>([]);
+  const [icebergs, setIcebergs] = useState<IcebergRecord[]>([]);
+  const [sentinel1Icebergs, setSentinel1Icebergs] = useState<Sentinel1GroundedIcebergRecord[]>([]);
+  const [driftingIcebergs, setDriftingIcebergs] = useState<DriftingIcebergTrajectoryRecord[]>([]);
+
+  // Selection & 2D Screen-space Projection Overlays
+  const [selectedDriftingIceberg, setSelectedDriftingIceberg] = useState<DriftingIcebergTrajectoryRecord | null>(null);
+  const [driftingIcebergScreenPos, setDriftingIcebergScreenPos] = useState<{ x: number; y: number } | null>(null);
+  const [selectedPort, setSelectedPort] = useState<PortRecord | null>(null);
+  const [portScreenPos, setPortScreenPos] = useState<{ x: number; y: number } | null>(null);
+
+  const [departurePort, setDeparturePort] = useState<PortRecord | null>(null);
+  const [departureScreenPos, setDepartureScreenPos] = useState<{ x: number; y: number } | null>(null);
+
+  const [destinationPort, setDestinationPort] = useState<PortRecord | null>(null);
+  const [destinationScreenPos, setDestinationScreenPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Maritime Route & Hazard Analysis
+  const [routeResult, setRouteResult] = useState<MaritimeRouteResult | null>(null);
+  const [isCalculatingRoute, setIsCalculatingRoute] = useState<boolean>(false);
+  const routeRequestIdRef = useRef<number>(0);
+
+  const [hazardReport, setHazardReport] = useState<IceHazardAnalysisReport | null>(null);
+  const [isAnalyzingHazards, setIsAnalyzingHazards] = useState<boolean>(false);
+
+  // Simulation State for Movement along Calculated Route
+  const [routeProfile, setRouteProfile] = useState<RouteGeometryProfile | null>(null);
+  const [simDistanceMeters, setSimDistanceMeters] = useState<number>(0);
+  const [simStatus, setSimStatus] = useState<'IDLE' | 'PLAYING' | 'PAUSED' | 'COMPLETED'>('IDLE');
+  const [simSpeedMultiplier, setSimSpeedMultiplier] = useState<number>(5);
+
+  const [selectedVessel, setSelectedVessel] = useState<VesselConfiguration | null>(null);
+  const [vesselScreenPos, setVesselScreenPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Status & Feedback Toast
+  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
+
+  const showToast = useCallback((msg: string) => {
+    if (feedbackTimerRef.current) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    setFeedbackMessage(msg);
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedbackMessage(null);
+      feedbackTimerRef.current = null;
+    }, 2800);
+  }, []);
+
+  // ─── URL Query Route Synchronization ─────────────────────────────────────
+  // Parse initial view and filter from URL search parameters on mount
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const viewParam = params.get('view')?.toLowerCase();
+    const filterParam = params.get('filter')?.toUpperCase();
+
+    if (viewParam === 'tactical' || viewParam === '2d') {
+      setActiveView('2D_TACTICAL');
+    }
+
+    if (filterParam === 'MOVING' || filterParam === 'FIXED' || filterParam === 'PORTS' || filterParam === 'ALL') {
+      setLayerFilter(filterParam as LayerFilterMode);
+    }
+
+    // Support browser Back/Forward navigation
+    const handlePopState = () => {
+      const p = new URLSearchParams(window.location.search);
+      const v = p.get('view')?.toLowerCase();
+      const f = p.get('filter')?.toUpperCase();
+      setActiveView(v === 'tactical' || v === '2d' ? '2D_TACTICAL' : '3D_GLOBE');
+      if (f === 'MOVING' || f === 'FIXED' || f === 'PORTS' || f === 'ALL') {
+        setLayerFilter(f as LayerFilterMode);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  // Update browser URL query params without triggering full page reload
+  const updateUrlParams = useCallback((view: '3D_GLOBE' | '2D_TACTICAL', filter: LayerFilterMode) => {
+    const params = new URLSearchParams(window.location.search);
+    if (view === '2D_TACTICAL') {
+      params.set('view', 'tactical');
+    } else {
+      params.delete('view');
+    }
+    if (filter !== 'ALL') {
+      params.set('filter', filter.toLowerCase());
+    } else {
+      params.delete('filter');
+    }
+    const newSearch = params.toString();
+    const newUrl = `${window.location.pathname}${newSearch ? `?${newSearch}` : ''}`;
+    if (window.location.search !== (newSearch ? `?${newSearch}` : '')) {
+      window.history.pushState(null, '', newUrl);
+    }
+  }, []);
+
+  const handleSelectLayerFilter = useCallback((mode: LayerFilterMode) => {
+    setLayerFilter(mode);
+    updateUrlParams(activeView, mode);
+    if (mode === 'PORTS') {
+      showToast(`Isolated & Highlighted: Maritime Ports (NGA WPI Pub 150 - ${ports.length > 0 ? ports.length.toLocaleString() : '3,807'} berths)`);
+    } else if (mode === 'MOVING') {
+      showToast(`Isolated & Highlighted: Historical Drift Tracks & Observed Ice (${driftingIcebergs.length || 624} BYU/NIC tracks, ${icebergs.length || 33} USNIC icebergs)`);
+    } else if (mode === 'FIXED') {
+      showToast(`Isolated & Highlighted: Grounded Radar Targets (${sentinel1Icebergs.length > 0 ? sentinel1Icebergs.length.toLocaleString() : '39,619'} Sentinel-1 SAR observations)`);
+    } else {
+      showToast('Displaying All Navigation Target Layers');
+    }
+  }, [activeView, ports.length, driftingIcebergs.length, icebergs.length, sentinel1Icebergs.length, showToast, updateUrlParams]);
+
+  const handleSelectPort = useCallback((port: PortRecord | null) => {
+    if (port) {
+      setFeedbackMessage(null);
+    }
+    setSelectedPort(port);
+  }, []);
+
+  const handleSetDeparture = useCallback((port?: PortRecord) => {
+    const target = port || selectedPort;
+    if (!target) return;
+
+    if (destinationPort?.wpiNumber === target.wpiNumber) {
+      showToast("Departure and destination cannot be the same port");
+      return;
+    }
+    setDeparturePort(target);
+    showToast(`Departure set to ${target.portName}`);
+  }, [selectedPort, destinationPort, showToast]);
+
+  const handleSelectDepartureFromSearch = useCallback((port: PortRecord) => {
+    if (destinationPort?.wpiNumber === port.wpiNumber) {
+      showToast("Departure and destination cannot be the same port");
+      return;
+    }
+    setDeparturePort(port);
+    setSelectedPort(port);
+    globeRef.current?.flyToPort(port);
+    showToast(`Departure set to ${port.portName} (WPI ${port.wpiNumber})`);
+  }, [destinationPort, showToast]);
+
+  const handleClearDeparture = useCallback(() => {
+    setDeparturePort(null);
+    setRouteResult(null);
+    showToast("Departure port cleared");
+  }, [showToast]);
+
+  const handleSetDestination = useCallback((port?: PortRecord) => {
+    const target = port || selectedPort;
+    if (!target) return;
+
+    if (departurePort?.wpiNumber === target.wpiNumber) {
+      showToast("Departure and destination cannot be the same port");
+      return;
+    }
+    setDestinationPort(target);
+    showToast(`Destination set to ${target.portName}`);
+  }, [selectedPort, departurePort, showToast]);
+
+  const handleSelectDestinationFromSearch = useCallback((port: PortRecord) => {
+    if (departurePort?.wpiNumber === port.wpiNumber) {
+      showToast("Departure and destination cannot be the same port");
+      return;
+    }
+    setDestinationPort(port);
+    setSelectedPort(port);
+    globeRef.current?.flyToPort(port);
+    showToast(`Destination set to ${port.portName} (WPI ${port.wpiNumber})`);
+  }, [departurePort, showToast]);
+
+  const handleClearDestination = useCallback(() => {
+    setDestinationPort(null);
+    setRouteResult(null);
+    showToast("Destination port cleared");
+  }, [showToast]);
+
+  const handleSwapPorts = useCallback(() => {
+    if (!departurePort || !destinationPort) return;
+    const prevDep = departurePort;
+    const prevDest = destinationPort;
+    setDeparturePort(prevDest);
+    setDestinationPort(prevDep);
+    showToast(`Swapped route direction: ${prevDest.portName} → ${prevDep.portName}`);
+  }, [departurePort, destinationPort, showToast]);
+
+  const handleClearRoute = useCallback(() => {
+    setDeparturePort(null);
+    setDestinationPort(null);
+    setRouteResult(null);
+    showToast("Active maritime route cleared");
+  }, [showToast]);
+
+  // Compute route whenever departure or destination changes (Single Authoritative Owner)
+  useEffect(() => {
+    let cancelled = false;
+    const currentRequestId = ++routeRequestIdRef.current;
+
+    // MANDATORY PRE-FLIGHT CLEARING:
+    // When endpoints change, immediately clear previous route state so the old
+    // route polyline disappears from the 3D globe and 2D tactical view without lingering.
+    setRouteResult(null);
+    setRouteProfile(null);
+    setSimDistanceMeters(0);
+    setSimStatus('IDLE');
+    setHazardReport(null);
+    setIsAnalyzingHazards(false);
+
+    if (departurePort && destinationPort) {
+      if (departurePort.wpiNumber === destinationPort.wpiNumber) {
+        setIsCalculatingRoute(false);
+        setRouteResult({
+          status: "NO_FEASIBLE_ROUTE",
+          routeName: "Computed Maritime Route",
+          coordinates: [],
+          distanceKm: 0,
+          candidateCountAttempted: 0,
+          rawNodeCount: 0,
+          finalNodeCount: 0,
+          failingReason: "Departure and destination ports cannot be the same",
+          provenance: {
+            dataset: "N/A",
+            version: "",
+            source: "",
+            license: "",
+            method: "",
+          },
+        });
+        return;
+      }
+
+      setIsCalculatingRoute(true);
+      requestMaritimeRoute(departurePort, destinationPort)
+        .then((res) => {
+          // Drop response if component unmounted or if a newer calculation request was initiated
+          if (cancelled || currentRequestId !== routeRequestIdRef.current) {
+            return;
+          }
+
+          setIsCalculatingRoute(false);
+
+          if (res && res.status === "SUCCESS" && res.coordinates && res.coordinates.length >= 2) {
+            setRouteResult(res);
+            const profile = buildRouteGeometryProfile(res.coordinates);
+            setRouteProfile(profile);
+            setSimDistanceMeters(0);
+            setSimStatus('IDLE');
+          } else {
+            // Failure or no feasible water path: clear route polyline, record failure reason for HUD
+            setRouteResult(res || null);
+            setRouteProfile(null);
+            setSimDistanceMeters(0);
+            setSimStatus('IDLE');
+            if (res?.failingReason) {
+              showToast(`No valid maritime route found (${res.failingReason})`);
+            }
+          }
+        })
+        .catch((err) => {
+          // Drop response if component unmounted, aborted, or if a newer calculation request was initiated
+          if (cancelled || currentRequestId !== routeRequestIdRef.current || err?.message === 'ABORTED_BY_NEWER_REQUEST') {
+            return;
+          }
+
+          console.error("Maritime routing calculation error:", err);
+          setIsCalculatingRoute(false);
+          setRouteResult(null);
+          setRouteProfile(null);
+          setSimDistanceMeters(0);
+          setSimStatus('IDLE');
+          showToast("Maritime routing failed: calculation error");
+        });
+    } else {
+      setIsCalculatingRoute(false);
+    }
+
+    return () => {
+      cancelled = true;
+      cancelCurrentRouting();
+    };
+  }, [departurePort, destinationPort]);
+
+  // Deterministic Route Simulation Animation Loop (nominal 15 knots = 7.71667 m/s * multiplier)
+  useEffect(() => {
+    if (simStatus !== 'PLAYING' || !routeProfile) return;
+
+    let animId: number;
+    let lastTimestamp = performance.now();
+
+    const frame = (now: number) => {
+      // Throttle simulation frame ticks to ~33 FPS to keep main thread snappy
+      if (now - lastTimestamp < 30) {
+        animId = requestAnimationFrame(frame);
+        return;
+      }
+      const dtSeconds = Math.max(0, (now - lastTimestamp) / 1000.0);
+      lastTimestamp = now;
+
+      // 15 knots = 7.71667 m/s
+      const nominalSpeedMps = 15.0 * 0.514444;
+      const advance = dtSeconds * nominalSpeedMps * simSpeedMultiplier;
+
+      setSimDistanceMeters((prev) => {
+        const next = prev + advance;
+        if (next >= routeProfile.totalDistanceMeters) {
+          setSimStatus('COMPLETED');
+          return routeProfile.totalDistanceMeters;
+        }
+        return next;
+      });
+
+      animId = requestAnimationFrame(frame);
+    };
+
+    animId = requestAnimationFrame(frame);
+
+    return () => {
+      cancelAnimationFrame(animId);
+    };
+  }, [simStatus, routeProfile, simSpeedMultiplier]);
+
+  // Evaluate current vessel simulation point along the route
+  const vesselPoint: RouteSimulationPoint = useMemo(() => {
+    return routeProfile
+      ? evaluateSimulationPoint(routeProfile, simDistanceMeters)
+      : departurePort
+      ? {
+          coordinate: [departurePort.longitude, departurePort.latitude],
+          headingDegrees: 0,
+          segmentIndex: 0,
+          distanceTraveledMeters: 0,
+          distanceRemainingMeters: 0,
+          totalDistanceMeters: 0,
+          progressPercent: 0,
+          isCompleted: false,
+        }
+      : {
+          coordinate: [
+            DEMO_VESSEL_CONFIG.geographicLocation.longitude,
+            DEMO_VESSEL_CONFIG.geographicLocation.latitude,
+          ],
+          headingDegrees: 55.0,
+          segmentIndex: 0,
+          distanceTraveledMeters: 0,
+          distanceRemainingMeters: 0,
+          totalDistanceMeters: 0,
+          progressPercent: 0,
+          isCompleted: false,
+        };
+  }, [routeProfile, simDistanceMeters, departurePort]);
+
+  const currentVesselLocation = useMemo(
+    () => ({
+      latitude: vesselPoint.coordinate[1],
+      longitude: vesselPoint.coordinate[0],
+      altitude: 0,
+      headingDegrees: vesselPoint.headingDegrees,
+    }),
+    [vesselPoint.coordinate[0], vesselPoint.coordinate[1], vesselPoint.headingDegrees]
+  );
+
+  // Perform rigorous spatial hazard analysis against real iceberg datasets when valid route exists
+  useEffect(() => {
+    let cancelled = false;
+
+    if (
+      routeResult &&
+      routeResult.status === "SUCCESS" &&
+      routeResult.coordinates.length >= 2 &&
+      (icebergs.length > 0 || sentinel1Icebergs.length > 0 || driftingIcebergs.length > 0)
+    ) {
+      setIsAnalyzingHazards(true);
+
+      analyzeRouteIcebergHazards(
+        routeResult.coordinates,
+        icebergs,
+        sentinel1Icebergs,
+        driftingIcebergs
+      )
+        .then((report) => {
+          if (!cancelled) {
+            setHazardReport(report);
+            setIsAnalyzingHazards(false);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.error("Hazard analysis error:", err);
+            setIsAnalyzingHazards(false);
+          }
+        });
+    } else {
+      setHazardReport(null);
+      setIsAnalyzingHazards(false);
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [routeResult, icebergs, sentinel1Icebergs, driftingIcebergs]);
+
+  // Load real-world NGA World Port Index & USNIC Antarctic Icebergs datasets
+  useEffect(() => {
+    let mounted = true;
+    loadPortDataset()
+      .then((data) => {
+        if (mounted) {
+          setPorts(data);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load WPI ports dataset:', err);
+      });
+
+    loadIcebergDataset()
+      .then((data) => {
+        if (mounted) {
+          setIcebergs(data);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load USNIC icebergs dataset:', err);
+      });
+
+    loadSentinel1GroundedIcebergDataset()
+      .then((data) => {
+        if (mounted) {
+          setSentinel1Icebergs(data);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load Sentinel-1 grounded icebergs dataset:', err);
+      });
+
+    loadDriftingIcebergDataset()
+      .then((data) => {
+        if (mounted) {
+          setDriftingIcebergs(data);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load BYU/NIC drifting icebergs dataset:', err);
+      });
+
+    return () => {
+      mounted = false;
+      if (feedbackTimerRef.current) {
+        window.clearTimeout(feedbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleResetCamera = useCallback(() => {
+    globeRef.current?.resetCamera();
+  }, []);
+
+  const handleFocusDeparture = useCallback(() => {
+    if (departurePort) {
+      setSelectedPort(departurePort);
+      globeRef.current?.flyToPort(departurePort);
+    }
+  }, [departurePort]);
+
+  const handleFocusDestination = useCallback(() => {
+    if (destinationPort) {
+      setSelectedPort(destinationPort);
+      globeRef.current?.flyToPort(destinationPort);
+    }
+  }, [destinationPort]);
+
+  const handleFocusRoute = useCallback(() => {
+    if (routeResult && routeResult.coordinates.length >= 2) {
+      globeRef.current?.flyToRoute(routeResult.coordinates);
+    }
+  }, [routeResult]);
+
+  const handleFocusHazard = useCallback((hazard: IcebergHazardItem) => {
+    globeRef.current?.flyToHazard(hazard);
+    showToast(`Focused hazard: Iceberg ${hazard.icebergId} (${hazard.relationship})`);
+  }, [showToast]);
+
+  const handleFocusVessel = useCallback(() => {
+    globeRef.current?.flyToVessel();
+  }, []);
+
+  const handleOpenTacticalView = useCallback(() => {
+    if (!routeResult || routeResult.status !== 'SUCCESS') {
+      showToast("Calculate a valid maritime route first to open 2D Tactical View");
+      return;
+    }
+    setActiveView('2D_TACTICAL');
+    updateUrlParams('2D_TACTICAL', layerFilter);
+    showToast("Switched to 2D Tactical Navigation View");
+  }, [routeResult, layerFilter, showToast, updateUrlParams]);
+
+  const handleBackToGlobe = useCallback(() => {
+    setActiveView('3D_GLOBE');
+    updateUrlParams('3D_GLOBE', layerFilter);
+    showToast("Returned to 3D Global Overview");
+  }, [layerFilter, showToast, updateUrlParams]);
+
+  const handlePlaySim = useCallback(() => {
+    if (!routeProfile) return;
+    setSimDistanceMeters((cur) => {
+      if (simStatus === 'COMPLETED' || cur >= routeProfile.totalDistanceMeters) {
+        return 0;
+      }
+      return cur;
+    });
+    setSimStatus('PLAYING');
+  }, [routeProfile, simStatus]);
+
+  const handlePauseSim = useCallback(() => {
+    setSimStatus('PAUSED');
+  }, []);
+
+  const handleResetSim = useCallback(() => {
+    setSimDistanceMeters(0);
+    setSimStatus('IDLE');
+  }, []);
+
+  const handleSeekDistance = useCallback((distMeters: number) => {
+    if (!routeProfile) return;
+    const clamped = Math.max(0, Math.min(routeProfile.totalDistanceMeters, distMeters));
+    setSimDistanceMeters(clamped);
+    if (clamped >= routeProfile.totalDistanceMeters) {
+      setSimStatus('COMPLETED');
+    }
+  }, [routeProfile]);
+
+  const handleSetSelectedPortDeparture = useCallback(() => {
+    if (selectedPort) handleSetDeparture(selectedPort);
+  }, [selectedPort, handleSetDeparture]);
+
+  const handleSetSelectedPortDestination = useCallback(() => {
+    if (selectedPort) handleSetDestination(selectedPort);
+  }, [selectedPort, handleSetDestination]);
+
+  const handleCloseSelectedPort = useCallback(() => {
+    setSelectedPort(null);
+  }, []);
+
+  const handleCloseSelectedVessel = useCallback(() => {
+    setSelectedVessel(null);
+  }, []);
+
+  const handleCloseSelectedDriftingIceberg = useCallback(() => {
+    setSelectedDriftingIceberg(null);
+  }, []);
+
+  return (
+    <div className="w-full h-full relative overflow-hidden bg-polar-950">
+
+      {/* ──────────── 2D TACTICAL NAVIGATION VIEW ──────────── */}
+      {activeView === '2D_TACTICAL' && routeResult && (
+        <Tactical2DView
+          ports={ports}
+          departurePort={departurePort}
+          destinationPort={destinationPort}
+          routeResult={routeResult}
+          icebergs={icebergs}
+          sentinel1Icebergs={sentinel1Icebergs}
+          driftingIcebergs={driftingIcebergs}
+          vesselPoint={vesselPoint}
+          simStatus={simStatus}
+          onPlay={handlePlaySim}
+          onPause={handlePauseSim}
+          onReset={handleResetSim}
+          onSeekDistance={handleSeekDistance}
+          simSpeedMultiplier={simSpeedMultiplier}
+          onSetSimSpeed={setSimSpeedMultiplier}
+          onBackToGlobe={handleBackToGlobe}
+          layerFilter={layerFilter}
+          onSelectLayerFilter={handleSelectLayerFilter}
+        />
+      )}
+
+      {/* ──────────── 3D GLOBE VIEW ──────────── */}
+      {activeView === '3D_GLOBE' && (
+        <>
+          {/* Mission Operational Header HUD (Top Left Visual Anchor) */}
+          <Header />
+
+          <CesiumGlobe
+            ref={globeRef}
+            className="w-full h-full"
+            ports={ports}
+            icebergs={icebergs}
+            sentinel1Icebergs={sentinel1Icebergs}
+            driftingIcebergs={driftingIcebergs}
+            hazardReport={hazardReport}
+            selectedPort={selectedPort}
+            onSelectPort={handleSelectPort}
+            onPortScreenPosChange={setPortScreenPos}
+            departurePort={departurePort}
+            onDepartureScreenPosChange={setDepartureScreenPos}
+            destinationPort={destinationPort}
+            onDestinationScreenPosChange={setDestinationScreenPos}
+            onInvalidClick={showToast}
+            selectedVessel={selectedVessel}
+            onSelectVessel={setSelectedVessel}
+            onScreenPositionChange={setVesselScreenPos}
+            selectedDriftingIceberg={selectedDriftingIceberg}
+            onSelectDriftingIceberg={setSelectedDriftingIceberg}
+            onDriftingIcebergScreenPosChange={setDriftingIcebergScreenPos}
+            vesselLocation={currentVesselLocation}
+            onOpenTacticalView={handleOpenTacticalView}
+            layerFilter={layerFilter}
+            maritimeRoute={routeResult}
+          />
+
+          {/* Layer Filter / Isolation & Highlight Toggle (Top Right) */}
+          <div className="absolute top-5 right-6 z-20 pointer-events-auto">
+            <LayerHighlightToggle
+              activeMode={layerFilter}
+              onSelectMode={handleSelectLayerFilter}
+              portsCount={ports.length || 3807}
+              driftingCount={driftingIcebergs.length || 624}
+              groundedCount={sentinel1Icebergs.length || 39619}
+            />
+          </div>
+
+          {/* Mission Departure Annotation (Hidden if port is actively selected to avoid overlap) */}
+          {departurePort && departureScreenPos && selectedPort?.wpiNumber !== departurePort.wpiNumber && (
+            <DepartureAnnotation
+              port={departurePort}
+              screenPosition={departureScreenPos}
+            />
+          )}
+
+          {/* Mission Destination Annotation (Hidden if port is actively selected to avoid overlap) */}
+          {destinationPort && destinationScreenPos && selectedPort?.wpiNumber !== destinationPort.wpiNumber && (
+            <DestinationAnnotation
+              port={destinationPort}
+              screenPosition={destinationScreenPos}
+            />
+          )}
+
+          {/* Geographically Anchored Vessel Map Annotation */}
+          {selectedVessel && vesselScreenPos && (
+            <VesselInfoCard
+              vessel={selectedVessel}
+              screenPosition={vesselScreenPos}
+              onClose={handleCloseSelectedVessel}
+              onOpenTacticalView={handleOpenTacticalView}
+            />
+          )}
+
+          {/* Single Geographically Anchored Selected Port Annotation */}
+          {selectedPort && portScreenPos && (
+            <PortAnnotation
+              port={selectedPort}
+              screenPosition={portScreenPos}
+              isDeparture={departurePort?.wpiNumber === selectedPort.wpiNumber}
+              onSetDeparture={handleSetSelectedPortDeparture}
+              onClearDeparture={handleClearDeparture}
+              isDestination={destinationPort?.wpiNumber === selectedPort.wpiNumber}
+              onSetDestination={handleSetSelectedPortDestination}
+              onClearDestination={handleClearDestination}
+              onClose={handleCloseSelectedPort}
+            />
+          )}
+
+          {/* Single Geographically Anchored Selected Drifting Iceberg Annotation */}
+          {selectedDriftingIceberg && driftingIcebergScreenPos && (
+            <DriftingIcebergAnnotation
+              iceberg={selectedDriftingIceberg}
+              screenPosition={driftingIcebergScreenPos}
+              onClose={handleCloseSelectedDriftingIceberg}
+            />
+          )}
+
+          {/* Mission Maritime Navigation Route Summary Panel */}
+          <RouteSummaryPanel
+            ports={ports}
+            departurePort={departurePort}
+            destinationPort={destinationPort}
+            routeResult={routeResult}
+            isCalculating={isCalculatingRoute}
+            hazardReport={hazardReport}
+            isAnalyzingHazards={isAnalyzingHazards}
+            onSelectDeparture={handleSelectDepartureFromSearch}
+            onSelectDestination={handleSelectDestinationFromSearch}
+            onSwapPorts={handleSwapPorts}
+            onClearDeparture={handleClearDeparture}
+            onClearDestination={handleClearDestination}
+            onClearRoute={handleClearRoute}
+            onFocusDeparture={handleFocusDeparture}
+            onFocusDestination={handleFocusDestination}
+            onFocusRoute={handleFocusRoute}
+            onFocusHazard={handleFocusHazard}
+            onOpenTacticalView={handleOpenTacticalView}
+          />
+
+          {/* Viewport & Navigation Map Controls */}
+          <div className="absolute bottom-6 right-6 z-20 pointer-events-auto select-none flex items-center gap-4 text-xs font-sans">
+            {routeResult && routeResult.status === 'SUCCESS' && (
+              <button
+                type="button"
+                onClick={handleOpenTacticalView}
+                className="text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+                title="Open 2D Tactical Navigation View"
+              >
+                2D Tactical
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleFocusVessel}
+              className="text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+              title="Locate R/V Polar Explorer"
+            >
+              Locate Vessel
+            </button>
+            <button
+              type="button"
+              onClick={handleResetCamera}
+              className="text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+              title="Reset globe to polar view"
+            >
+              Reset Camera
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* Operational Feedback Toast */}
+      {feedbackMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="absolute top-5 left-1/2 -translate-x-1/2 z-50 pointer-events-none select-none"
+        >
+          <div className="text-slate-300 text-xs font-sans flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+            <span>{feedbackMessage}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
